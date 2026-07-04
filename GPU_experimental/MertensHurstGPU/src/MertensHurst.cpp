@@ -1,0 +1,799 @@
+#include "MertensHurst.h"
+#include "S2.h"
+#include "S1.h"
+#include "SegmentedMertensSieve.h"
+
+// Mirrors the default in SegmentedMobiusSieve.cpp; override with -DUSE_BUCKET_SIEVE=0.
+#ifndef USE_BUCKET_SIEVE
+#define USE_BUCKET_SIEVE 1
+#endif
+
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <omp.h>
+#include <stdexcept>
+#include <sys/time.h>
+
+#ifdef USE_GPU_S2
+// GPU offload of the 64-bit S2 updates (see gpu_s2.h).
+// All hooks are compiled out unless -DUSE_GPU_S2 is given, leaving the
+// default CPU build byte-identical. Even in GPU builds, the offload can be
+// disabled at runtime with MERTENS_GPU_S2=0 for CPU/GPU A-B comparisons
+// from one binary.
+#include "gpu_s2.h"
+#include <cstdlib>
+static GpuS2* gGpuS2 = nullptr;
+#endif
+
+// ============================================================================
+// Timing helpers
+// ============================================================================
+
+static inline void getDayTime(timeval& t) { gettimeofday(&t, NULL); }
+
+static inline double getDuration(timeval& start, timeval& end) {
+    return (Int64)(end.tv_sec) - (Int64)(start.tv_sec) + (end.tv_usec - start.tv_usec)/1000000.0;
+}
+
+// Runtime-conditional profiling. These macros are only invoked once per sieve
+// segment (not in inner loops), so the branch cost is negligible.
+#define START_PROFILE() do { if (profile) getDayTime(start); } while(0)
+#define END_PROFILE(t)  do { if (profile) { \
+    getDayTime(end); (t) += getDuration(start, end); } } while(0)
+
+namespace {
+
+// ============================================================================
+// Bounds on n: see INPUT_BOUNDS.md for the full analysis.
+// The code enforces 10^8 <= n <= 10^25.
+// ============================================================================
+
+// Compute primes up to ceil(sqrt(limit)), respecting the sieve's minimum bound.
+static std::vector<UInt32> sievePrimesUpToSqrt(UInt64 limit) {
+    return SegmentedMobiusSieveCore::primesUpTo(std::max(
+        (UInt32)SegmentedMobiusSieveCore::MIN_PRIMES_BOUND,
+        (UInt32)std::ceil(std::sqrt((double)limit))));
+}
+
+// ============================================================================
+// MertensComputer — internal class that orchestrates the full computation.
+// Hidden in an anonymous namespace; exposed via the MertensHurst() free function.
+// ============================================================================
+
+class MertensComputer {
+public:
+    Int64 compute(UInt128 n, bool profile, UInt64 segmentCap,
+                  UInt64 uOverride, double uFactor, double nuRatio);
+
+private:
+    SegmentedMertensSieveCore mSieve;
+    double mNuRatio;
+
+    static UInt64 getSegmentSize(UInt128 n, UInt64 u);
+
+    void initializeBounds(
+        UInt128 n, UInt64 u,
+        const Int8* mu,
+        std::vector<UInt128>& partialArgs128,
+        std::vector<UInt64>& partialArgs,
+        std::vector<UInt64>& nus,
+        std::vector<UInt64>& kappas,
+        std::vector<UInt64>& kappas2,
+        std::vector<UInt64>& partialArgsDivU,
+        std::vector<UInt32>& hash,
+        std::vector<UInt32>& hash2,
+        std::vector<UInt64>& s2SplitCache
+    );
+
+    struct Chunk {
+        UInt32 i;
+        UInt64 a;
+        UInt64 b;
+    };
+
+    static UInt64 isqrt_u128(const UInt128& a);
+    UInt64 get_nu(const UInt128& x);
+};
+
+// ============================================================================
+// Utility functions
+// ============================================================================
+
+UInt64 MertensComputer::isqrt_u128(const UInt128& a) {
+    if (a == 0) return 0;
+    long double da = (long double)a;
+    UInt64 x = UInt64(sqrtl(da));
+
+    while (UInt128(x+1) * UInt128(x+1) <= a) ++x;
+    while (UInt128(x)   * UInt128(x)   >  a) --x;
+
+    return x;
+}
+
+// nu_y = floor(c * sqrt(y)), c = 1.5 by default. Bigger c means more
+// work in S1 (cheap per-term: just an array lookup) and less in S2
+// (expensive: sums over M). 1.5 roughly balances sieve, S1, and S2.
+UInt64 MertensComputer::get_nu(const UInt128& x) {
+    return static_cast<UInt64>(mNuRatio * static_cast<double>(isqrt_u128(x)));
+}
+
+UInt64 MertensComputer::getSegmentSize(UInt128 n, UInt64 u) {
+    constexpr UInt64 BF = SegmentedMobiusSieveCore::STENCIL_PERIOD;
+    UInt64 len = static_cast<UInt64>(std::log10((double)n + 3));
+
+    if (len < 14) {
+        return std::max(UInt64(BF), UInt64(BF) * (static_cast<UInt64>(std::sqrt((double)n)) / BF));
+    }
+
+    UInt64 B = BF * static_cast<UInt64>((std::ceil(std::sqrt(2.0 * u)) + 1) / BF + 1);
+
+    return std::max(UInt64(3104640ULL), len < 15 ? 4*B : 2*B);
+}
+
+// ============================================================================
+// Initialize cached bounds
+// ============================================================================
+
+void MertensComputer::initializeBounds(
+    UInt128 n, UInt64 u,
+    const Int8* mu,
+    std::vector<UInt128>& partialArgs128,
+    std::vector<UInt64>& partialArgs,
+    std::vector<UInt64>& nus,
+    std::vector<UInt64>& kappas,
+    std::vector<UInt64>& kappas2,
+    std::vector<UInt64>& partialArgsDivU,
+    std::vector<UInt32>& hash,
+    std::vector<UInt32>& hash2,
+    std::vector<UInt64>& s2SplitCache
+) {
+    UInt32 end = hash.size();
+    UInt32 i = 1;
+
+    for (UInt32 j = 1; j < end; ++j) {
+        if (mu[j-1]) {
+            hash[j] = i;
+            hash2[i] = j;
+            const UInt128 quotient = n / j;
+
+            if (quotient > UInt128(1000000000000000000ULL))
+                partialArgs128.push_back(quotient);
+            else
+                partialArgs[i] = UInt64(quotient);
+
+            partialArgsDivU[i] = quotient / u;
+
+            nus[i] = get_nu(quotient);
+
+            const UInt128 q2 = quotient / 2;
+            const UInt64  n2 = get_nu(q2);
+
+            kappas[i]  =   quotient / (nus[i] + 1);
+            kappas2[i] = 2 * (q2 / (n2 + 1));
+
+            s2SplitCache[i] = n2;
+
+            ++i;
+        }
+    }
+}
+
+// ============================================================================
+// Main computation
+// ============================================================================
+
+Int64 MertensComputer::compute(UInt128 n, bool profile, UInt64 segmentCap,
+                               UInt64 uOverride, double uFactor, double nuRatio) {
+    // 10^8 <= n
+    if (__builtin_expect(n < 100000000ULL, false)) {
+        std::cerr << "Error: MertensComputer::compute requires n >= 10^8." << std::endl;
+        std::abort();
+    }
+
+    // n <= 10^25
+    if (__builtin_expect(n > UInt128(1000000000000ULL) * UInt128(10000000000000ULL), false)) {
+        std::cerr << "Error: MertensComputer::compute requires n <= 10^25. "
+                  << "See \"Upper bounds on n\" in MertensHurst.cpp to extend." << std::endl;
+        std::abort();
+    }
+
+    // Validate mutually exclusive u parameters
+    if (uOverride > 0 && uFactor > 0.0) {
+        std::cerr << "Error: uOverride and uFactor are mutually exclusive." << std::endl;
+        std::abort();
+    }
+
+    // Validate nuRatio
+    if (nuRatio <= 0.0) {
+        std::cerr << "Error: nuRatio must be positive (got " << nuRatio << ")." << std::endl;
+        std::abort();
+    }
+    mNuRatio = nuRatio;
+
+#ifdef USE_GPU_S2
+    {
+        const char* env = std::getenv("MERTENS_GPU_S2");
+        const bool wantGpu = !(env && env[0] == '0');
+        if (wantGpu && !gGpuS2) gGpuS2 = gpus2_create();
+        if (!wantGpu && gGpuS2) { gpus2_destroy(gGpuS2); gGpuS2 = nullptr; }
+        if (profile)
+            std::cout << "GPU S2 offload: "
+                      << (gGpuS2 ? "ENABLED" : "disabled/unavailable (CPU path)") << std::endl;
+    }
+#endif
+
+    struct timeval start, end;
+    double t[8] = {0.0};
+
+    constexpr UInt64 BF = SegmentedMobiusSieveCore::STENCIL_PERIOD;
+    constexpr UInt64 min_B = BF * ((10000000ULL + BF - 1) / BF);
+
+    // Compute u: direct override, factor override, or default formula
+    UInt64 u;
+    if (uOverride > 0) {
+        u = uOverride;
+    } else {
+        double fac;
+        if (uFactor > 0.0) {
+            fac = uFactor;
+        } else {
+            fac = std::clamp(1.85 - 0.05 * std::log10((double)n), 0.75, 1.05);
+        }
+        u = std::ceil(fac * std::pow(std::cbrt((double)n / std::log(std::log((double)n))), 2));
+    }
+
+    // Validate u bounds
+    if (u >= n) {
+        std::cerr << "Error: u must be less than n (got u=" << u << ")." << std::endl;
+        std::abort();
+    }
+    // Enforce hard sieve caps on u, from any source (see INPUT_BOUNDS.md).
+    {
+        // UInt32 prime storage: sqrt(u) < 2^32. This also guarantees the
+        // ceil-log2 byte-encoding requirement u < 2^64.
+        UInt64 uMax = 4294967295ULL * 4294967295ULL;
+#if USE_BUCKET_SIEVE
+        // Bucket scheduler reach: sqrt(u) < LP_SIZE * M2.
+        constexpr UInt64 reach = SegmentedMobiusSieveCore::schedulerReach();
+        uMax = std::min(uMax, reach * reach);
+#endif
+        if (u > uMax) {
+            std::cerr << "Error: sieve bound u = " << u << " exceeds the hard cap "
+                      << uMax << " for this build (see INPUT_BOUNDS.md)." << std::endl;
+            std::abort();
+        }
+    }
+    // nu = n/u controls the S1/S2 boundary: S2 sums over [y/u, kappa_y],
+    // S1 sums over [1, nu_y]. Sieve range is [1, nu_max] where nu_max = nu_1 = n/u.
+    UInt64 nu = n / u;
+    UInt64 B = std::min(min_B, getSegmentSize(n, u));
+
+    // Round up to stencil alignment
+    const UInt64 nuCAP = BF * (nu / BF + 1);
+
+    // Initial sieve of mu over [1, nuCAP] for squarefree detection
+    SegmentedMobiusSieveCore initialSieve;
+    std::vector<UInt32> primes = sievePrimesUpToSqrt(nuCAP);
+    initialSieve.initialize(nuCAP);
+    initialSieve.sieve(1, nuCAP, primes);
+
+    // mx = number of squarefree integers in [1, nu]. Only squarefree k
+    // contribute to the outer sum (since mu(k)=0 otherwise).
+    Int32 mx = 0;
+    for (UInt32 i = 0; i < nu; ++i) {
+        mx += initialSieve[i] & 1;
+    }
+
+    // hash[j] = compressed index of squarefree j, hash2[i] = original j.
+    // only squarefree j get entries — skips the ~39% with mu(j)=0.
+    std::vector<UInt32> hash(nu+1, 0);
+    std::vector<UInt32> hash2(nu+1, 0);
+    std::vector<UInt64> partialArgs(mx+1), nusVec(mx+1), kappas(mx+1), kappas2(mx+1), partialArgsDivU(mx+1);
+    std::vector<UInt64> s2SplitCache(mx + 1, 0);
+
+    std::vector<UInt128> partialArgs128(1, UInt128(0));
+
+    std::vector<UInt64> qcache(2*mx+2, 0);
+
+    initializeBounds(n, u, initialSieve.data(),
+                     partialArgs128, partialArgs, nusVec, kappas, kappas2,
+                     partialArgsDivU, hash, hash2, s2SplitCache);
+
+    const UInt64 nuMax = nusVec[1];
+    const UInt32 cnt128 = partialArgs128.size()-1;
+
+    // partialValues[i] holds S(x/k, u) for squarefree k = hash2[i].
+    // Starts at 1 (leading term). After all sieve segments, back substitution
+    // gives M(x) = partialValues[1].
+    // The cnt128 largest x/k values need 128-bit accumulators (x/k > 10^18).
+    std::vector<Int64> partialValues(mx+1, 1);
+    std::vector<Int128> partialValues128(cnt128+1, 1);
+    partialValues[0] = 0;
+    partialValues128[0] = 0;
+
+    // initialize the primes used in SegmentedMertensSieveCore
+    primes = sievePrimesUpToSqrt(u);
+
+    // initialize the sieve for the main loops
+    mSieve.initialize(B);
+
+    // Granlund-Montgomery quotient cache: precompute magic multipliers for
+    // d <= cbrt(2n), turning ~40-cycle 128-bit divisions into ~6-cycle
+    // multiply-and-correct in the S1/S2 inner loops.
+    // (no-op when USE_DIVISION_FREE=0)
+    QuotientCache qCache;
+    UInt64 dCAP = 0;
+    if constexpr (UseDivisionFree) {
+        dCAP = static_cast<UInt64>(std::ceil(std::cbrt(2.0 * (double)n)));
+        qCache.init(dCAP);
+    }
+
+    // Compressed M: coarse[i] = M at every 256th position, R[i] = Int8 offset
+    // from the nearest coarse sample. Lookup is M(k) = coarse[k>>8] + R[k].
+    // 4x smaller than full Int32, which matters a lot for S1 cache behavior.
+    //
+    // Loop 0 uses Int16 coarse (safe up to n ~ 7.6e9),
+    // Loop 1 switches to Int32 for the rest of [1, nuMax].
+    constexpr int M_LOG_STRIDE = SegmentedMertensSieveCore::STRIDE_LOG;
+
+    std::vector<Int16> M16(B >> M_LOG_STRIDE, 0);
+    Int16 M16Prev = 0;
+
+    std::vector<Int32> M32(B >> M_LOG_STRIDE, 0);
+    Int32 MPrev = 0;
+
+    std::vector<Int8> R(B, 0);
+
+    // pointers
+    Int16* M16P = M16.data();
+    Int32* MP   = M32.data();
+    Int8*  RP   = R.data();
+    Int8*  MuP  = mSieve.mobiusSieve().data();
+
+    UInt64 L1 = 1;
+    UInt64 L2 = B;
+
+    // kappa_y * M(nu_y) correction term. picked up incrementally as nu
+    // values land in processed sieve segments.
+    Int32 j = mx;
+    UInt64 osqrt = nusVec[j];
+
+    // S2 work gets split into CHUNK_LEN-sized chunks for OpenMP.
+    // needs to be > cbrt(n) so chunks stay in the quotient predictor range.
+    std::vector<Chunk> chunks;
+#ifdef USE_GPU_S2
+    // Co-partition prototype: indices of 64-bit mx1 S2 tasks diverted from the
+    // GPU back to the CPU (the GPU is the saturated long pole at large n, and
+    // the CPU computes S2 ~2x faster per unit work). Empty unless
+    // MERTENS_GPU_S2_CPUFRAC > 0.
+    std::vector<UInt32> cpuMx1;
+#endif
+    UInt64 CHUNK_LEN = BF * (static_cast<UInt64>(4.0 * std::cbrt((double)n)) / BF + 1);
+    Int32 mx0 = 1, mx1 = mx;
+    while (mx0 < mx && nusVec[mx0] > CHUNK_LEN) { ++mx0; }
+
+    if (mx0 >= (Int32)(nu/2)) {
+        std::cerr << "Error: u is too large (u=" << u << ", nu=" << nu << ", mx0=" << mx0
+                  << "). Decrease --u or --u-factor." << std::endl;
+        std::abort();
+    }
+
+    // ========================================================================
+    // Loop 0/1 iteration lambda
+    // ========================================================================
+
+    auto doLoop01Iteration = [&](auto& _MP,
+                                   auto& _MPrev,
+                                   const UInt64 bound,
+                                   const int prof_base) {
+        while (L2 < bound) {
+            // ------------ Sieve Step ------------
+            START_PROFILE();
+            L2 = L1 + B - 1;
+            mSieve.sieve(L1, L2, _MPrev, _MP, RP, primes);
+            _MPrev = GET_M(_MP, RP, L1, L2);
+            END_PROFILE(t[prof_base + 0]);
+
+            // ------------ S2 Step ------------
+            START_PROFILE();
+#ifdef USE_GPU_S2
+            // GPU path: route every 64-bit S2 task of this segment to the GPU
+            // (mode decomposition replicated host-side in gpus2_add_task),
+            // dispatch asynchronously, and run the few 128-bit args on the
+            // CPU now. S1 below executes while the GPU works; the results
+            // are applied after S1. mx0/mx1 bookkeeping matches the CPU
+            // path exactly.
+            bool s2OnGpu = false;
+            if (gGpuS2) {
+                s2OnGpu = true;
+                gpus2_begin_segment(gGpuS2, MuP, L2 - L1 + 1, L1,
+                                  partialValues.data());
+
+                // Co-partition knob: target fraction of 64-bit S2 visits to
+                // keep on the CPU (greedy-balanced as tasks are routed). 0.0 =
+                // all-GPU (original behavior). 128-bit args are always CPU and
+                // are not counted in the fraction.
+                static const double kCpuFrac = []{
+                    const char* e = std::getenv("MERTENS_GPU_S2_CPUFRAC");
+                    return e ? atof(e) : 0.0;
+                }();
+                UInt64 cpuVisits = 0, gpuVisits = 0;
+                auto routeCpu = [&](UInt64 w) -> bool {
+                    if (kCpuFrac <= 0.0) return false;
+                    if (kCpuFrac >= 1.0) { cpuVisits += w; return true; }
+                    const bool cpu = (double)cpuVisits
+                                   <= kCpuFrac * (double)(cpuVisits + gpuVisits);
+                    if (cpu) cpuVisits += w; else gpuVisits += w;
+                    return cpu;
+                };
+
+                chunks.clear();
+                cpuMx1.clear();
+                for (UInt32 i = 1; i <= (UInt32)mx0; ++i) {
+                    if (hash2[i] & 1) {
+                        const UInt64 m = std::min(L2, nusVec[i]);
+                        if (L1 > m) { mx0 = i-1; break; }
+
+                        if (i > cnt128) {
+                            if (routeCpu((m - L1) / 3 + 1)) {
+                                for (UInt64 a = L1; a <= m; a += CHUNK_LEN)
+                                    chunks.push_back(Chunk{i, a, std::min(a + CHUNK_LEN - 1, m)});
+                            } else {
+                                gpus2_add_task(gGpuS2, partialArgs[i], L1, m,
+                                               nusVec[i], s2SplitCache[i], true, i);
+                            }
+                        } else {
+                            for (UInt64 a = L1; a <= m; a += CHUNK_LEN)
+                                chunks.push_back(Chunk{i, a, std::min(a + CHUNK_LEN - 1, m)});
+                        }
+                    }
+                }
+
+                UInt64 gpuMx1Cap = 0;
+                if (mx1 > mx0) {
+                    while (mx1 > mx0 && nusVec[mx1] < L1) { --mx1; }
+                    gpuMx1Cap = (UInt64)mx1;
+                    for (UInt64 i = mx0+1; i <= gpuMx1Cap; ++i) {
+                        const UInt64 jj = hash2[i];
+                        if ((jj & 1ULL) && i > cnt128) {
+                            const UInt64 m = std::min(L2, nusVec[i]);
+                            if (routeCpu((m - L1) / 3 + 1)) {
+                                cpuMx1.push_back((UInt32)i);
+                            } else {
+                                gpus2_add_task(gGpuS2, partialArgs[i], L1, m,
+                                               nusVec[i], s2SplitCache[i],
+                                               jj <= nu/2, (UInt32)i);
+                            }
+                        }
+                    }
+                }
+
+                gpus2_dispatch_async(gGpuS2);
+
+                // CPU work, concurrent with the GPU: mx0 chunks (64-bit
+                // co-partitioned + all 128-bit), then mx1 (64-bit
+                // co-partitioned + all 128-bit).
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (std::size_t tt = 0; tt < chunks.size(); ++tt) {
+                    const Chunk& c = chunks[tt];
+                    const UInt32 i = c.i;
+                    if (__builtin_expect(i > cnt128, true)) {
+                        const Int64 v = update_S2<true>(
+                            partialArgs[i], L1, c.a, c.b, MuP,
+                            nusVec[i], s2SplitCache[i], qCache, dCAP);
+                        #pragma omp atomic
+                        partialValues[i] -= v;
+                    } else {
+                        const Int128 v = update_S2_128<true>(
+                            partialArgs128[i], L1, c.a, c.b, MuP,
+                            nusVec[i], s2SplitCache[i]);
+                        #pragma omp critical
+                        partialValues128[i] -= v;
+                    }
+                }
+                const UInt64 cpuHi = std::min((UInt64)cnt128, gpuMx1Cap);
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (UInt64 i = mx0+1; i <= cpuHi; ++i) {
+                    const UInt64 jj = hash2[i];
+                    if (jj & 1ULL) {
+                        const Int128 v = (jj <= nu/2)
+                            ? update_S2_128<true>(partialArgs128[i], L1, L1,
+                                std::min(L2, nusVec[i]), MuP,
+                                nusVec[i], s2SplitCache[i])
+                            : update_S2_128<false>(partialArgs128[i], L1, L1,
+                                std::min(L2, nusVec[i]), MuP,
+                                nusVec[i], s2SplitCache[i]);
+                        partialValues128[i] -= v;
+                    }
+                }
+                // 64-bit mx1 tasks diverted to the CPU
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (std::size_t tt = 0; tt < cpuMx1.size(); ++tt) {
+                    const UInt32 i = cpuMx1[tt];
+                    const UInt64 jj = hash2[i];
+                    const Int64 v = (jj <= nu/2)
+                        ? update_S2<true>(partialArgs[i], L1, L1,
+                            std::min(L2, nusVec[i]), MuP,
+                            nusVec[i], s2SplitCache[i], qCache, dCAP)
+                        : update_S2<false>(partialArgs[i], L1, L1,
+                            std::min(L2, nusVec[i]), MuP,
+                            nusVec[i], s2SplitCache[i], qCache, dCAP);
+                    #pragma omp atomic
+                    partialValues[i] -= v;
+                }
+            }
+            if (!s2OnGpu) {
+#endif
+            chunks.clear();
+            for (UInt32 i = 1; i <= (UInt32)mx0; ++i) {
+                if (hash2[i] & 1) {
+                    const UInt64 m = std::min(L2, nusVec[i]);
+                    if (L1 > m) { mx0 = i-1; break; }
+
+                    for (UInt64 a = L1; a <= m; a += CHUNK_LEN)
+                        chunks.push_back(Chunk{i, a, std::min(a + CHUNK_LEN - 1, m)});
+                }
+            }
+
+            // dynamic: cost per chunk varies wildly (small k is O(sqrt(x/k)),
+            // large k is basically free)
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (std::size_t tt = 0; tt < chunks.size(); ++tt) {
+                const Chunk& c = chunks[tt];
+                const UInt32 i = c.i;
+                if (__builtin_expect(i > cnt128, true)) {
+                    const Int64 v = update_S2<true>(
+                        partialArgs[i], L1, c.a, c.b, MuP,
+                        nusVec[i], s2SplitCache[i], qCache, dCAP);
+                    #pragma omp atomic
+                    partialValues[i] -= v;
+                } else {
+                    const Int128 v = update_S2_128<true>(
+                        partialArgs128[i], L1, c.a, c.b, MuP,
+                        nusVec[i], s2SplitCache[i]);
+                    #pragma omp critical
+                    partialValues128[i] -= v;
+                }
+            }
+
+            if (mx1 > mx0) {
+                while (mx1 > mx0 && nusVec[mx1] < L1) { --mx1; }
+
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (UInt64 i = mx0+1; i <= (UInt64)mx1; ++i) {
+                    const UInt64 jj = hash2[i];
+                    if (jj & 1ULL) {
+                        if (__builtin_expect(i > cnt128, true)) {
+                            const Int64 v = (jj <= nu/2)
+                                ? update_S2<true>(partialArgs[i], L1, L1,
+                                    std::min(L2, nusVec[i]), MuP,
+                                    nusVec[i], s2SplitCache[i], qCache, dCAP)
+                                : update_S2<false>(partialArgs[i], L1, L1,
+                                    std::min(L2, nusVec[i]), MuP,
+                                    nusVec[i], s2SplitCache[i], qCache, dCAP);
+
+                            partialValues[i] -= v;
+                        } else {
+                            const Int128 v = (jj <= nu/2)
+                                ? update_S2_128<true>(partialArgs128[i], L1, L1,
+                                    std::min(L2, nusVec[i]), MuP,
+                                    nusVec[i], s2SplitCache[i])
+                                : update_S2_128<false>(partialArgs128[i], L1, L1,
+                                    std::min(L2, nusVec[i]), MuP,
+                                    nusVec[i], s2SplitCache[i]);
+
+                            partialValues128[i] -= v;
+                        }
+                    }
+                }
+            }
+#ifdef USE_GPU_S2
+            }
+#endif
+            END_PROFILE(t[prof_base + 1]);
+
+            // ------------ S1 Step ------------
+            START_PROFILE();
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (UInt64 i = 1; i <= (UInt64)mx; ++i) {
+                const UInt64 jj = hash2[i];
+                if (jj & 1ULL) {
+                    const bool doAll = (jj > nu/2);
+                    if (__builtin_expect(i > cnt128, true)) {
+                        apply_S1_updates(doAll, partialValues[i], partialArgs[i],
+                                         partialArgsDivU[i], kappas[i], kappas2[i],
+                                         L1, L2, _MP, RP, qCache, dCAP);
+                    } else {
+                        const UInt64 k = hash[2*jj];
+                        apply_S1_updates(doAll, partialValues128[i], partialArgs128[i],
+                                         partialArgsDivU[i], kappas[i], kappas2[i],
+                                         L1, L2, _MP, RP, qCache, dCAP,
+                                         &qcache[2*i], &qcache[2*i+1],
+                                         &qcache[2*k], &qcache[2*k+1]);
+                    }
+                }
+            }
+            END_PROFILE(t[prof_base + 2]);
+
+#ifdef USE_GPU_S2
+            if (s2OnGpu) {
+                START_PROFILE();
+                gpus2_wait_apply(gGpuS2, partialValues.data());
+                END_PROFILE(t[prof_base + 1]);
+            }
+#endif
+
+            // ------------ Extra term Step ------------
+            while (j && osqrt <= L2) {
+                const Int64 mval = static_cast<Int64>(GET_M(_MP, RP, L1, osqrt));
+                if (__builtin_expect((UInt32)j > cnt128, true))
+                    partialValues[j] += static_cast<Int64>(kappas[j]) * mval;
+                else
+                    partialValues128[j] += kappas[j] * static_cast<Int128>(mval);
+
+                osqrt = nusVec[--j];
+            }
+
+            L1 = L2 + 1;
+        }
+    };
+
+    // |M(n)| < 128 for all n <= 7,613,644,886, so Int16 is safe for Loop 0.
+    // MFRAC adds a little safety margin.
+#define MFRAC 0.97
+#define M16BITMAX UInt64(MFRAC * 7613644886ULL)
+
+    // Loop 0: sieve [1, min(nuMax, M16BITMAX)] with Int16 M accumulators.
+    // Both S1 and S2 updates are performed per segment.
+    doLoop01Iteration(M16P, M16Prev, std::min(nuMax, M16BITMAX), 0);
+
+    // Loop 1: continue with Int32 M accumulators up to nuMax.
+    MPrev = M16Prev;
+    doLoop01Iteration(MP, MPrev, nuMax, 3);
+
+#undef M16BITMAX
+#undef MFRAC
+
+    nusVec = std::vector<UInt64>({});
+    s2SplitCache = std::vector<UInt64>({});
+    chunks = std::vector<Chunk>({});
+
+    // Loop 2 only does S1 (S2 is done after Loop 0/1), so segments can be
+    // much larger — up to ~12 billion elements — to cut down on the
+    // per-segment cost of sweeping over partial values.
+    const UInt64 segmentCapRounded = BF * ((segmentCap + BF - 1) / BF);
+    B = 20 * 96 * BF * static_cast<UInt64>((std::ceil(std::sqrt(2.0 * u)) + 1) / BF + 1);
+    B = std::min(B, segmentCapRounded);
+    M32.resize(B >> M_LOG_STRIDE);
+
+    mSieve.mobiusSieve().fillFromStencil(B);
+
+    // pointers — R aliases Mu (in-place prefix sum, saves ~12GB at large n)
+    MP  = M32.data();
+    RP  = mSieve.mobiusSieve().data();
+    MuP = mSieve.mobiusSieve().data();
+
+    // ========================================================================
+    // Main loop #2
+    // ========================================================================
+
+    while (L2 < u) {
+        START_PROFILE();
+        L2 = std::min(L1 + B - 1, u);
+        mSieve.sieveInPlace(L1, L2, MPrev, MP, primes);
+        MPrev = GET_M(MP, RP, L1, L2);
+        END_PROFILE(t[6]);
+
+        START_PROFILE();
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (UInt64 i = 1; i <= (UInt64)mx; ++i) {
+            UInt64 jj = hash2[i];
+            if (jj & 1ULL) {
+                const bool doAll = (jj > nu/2);
+                if (__builtin_expect(i > cnt128, true)) {
+                    apply_S1_updates(doAll, partialValues[i], partialArgs[i],
+                                     partialArgsDivU[i], kappas[i], kappas2[i], L1, L2, MP, RP,
+                                     qCache, dCAP);
+                } else {
+                    const UInt64 k = hash[2*jj];
+                    apply_S1_updates(doAll, partialValues128[i], partialArgs128[i],
+                                     partialArgsDivU[i], kappas[i], kappas2[i],
+                                     L1, L2, MP, RP, qCache, dCAP,
+                                     &qcache[2*i], &qcache[2*i+1], &qcache[2*k], &qcache[2*k+1]);
+                }
+            }
+        }
+        END_PROFILE(t[7]);
+
+        L1 = L2 + 1;
+    }
+
+    if (profile) {
+        double tot = t[0] + t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7];
+
+        std::cout << std::endl;
+        std::cout << "-------------- Parameters -------------------" << std::endl;
+        std::cout << "              u: " << u << std::endl;
+        std::cout << "        nuRatio: " << mNuRatio << std::endl;
+        std::cout << std::endl;
+        if (t[0] + t[1] + t[2] > 0.0) {
+            std::cout << "--------------- Loop 1 16-bit ---------------" << std::endl;
+            std::cout << "          Sieve: " << t[0] << ", " << (100.0*t[0]/tot) << "%" << std::endl;
+            std::cout << "             S1: " << t[2] << ", " << (100.0*t[2]/tot) << "%" << std::endl;
+            std::cout << "             S2: " << t[1] << ", " << (100.0*t[1]/tot) << "%" << std::endl;
+        }
+        if (t[3] + t[4] + t[5] > 0.0) {
+            std::cout << "--------------- Loop 1 32-bit ---------------" << std::endl;
+            std::cout << "          Sieve: " << t[3] << ", " << (100.0*t[3]/tot) << "%" << std::endl;
+            std::cout << "             S1: " << t[5] << ", " << (100.0*t[5]/tot) << "%" << std::endl;
+            std::cout << "             S2: " << t[4] << ", " << (100.0*t[4]/tot) << "%" << std::endl;
+        }
+        if (t[6] + t[7] > 0.0) {
+            std::cout << "--------------- Loop 2 32-bit ---------------" << std::endl;
+            std::cout << "          Sieve: " << t[6] << ", " << (100.0*t[6]/tot) << "%" << std::endl;
+            std::cout << "             S1: " << t[7] << ", " << (100.0*t[7]/tot) << "%" << std::endl;
+        }
+        std::cout << "------------------ Totals -------------------" << std::endl;
+        std::cout << "          Sieve: " << (t[0]+t[3]+t[6]) << ", " << (100.0*(t[0]+t[3]+t[6])/tot) << "%" << std::endl;
+        std::cout << "             S1: " << (t[2]+t[5]+t[7]) << ", " << (100.0*(t[2]+t[5]+t[7])/tot) << "%" << std::endl;
+        std::cout << "             S2: " << (t[1]+t[4]     ) << ", " << (100.0*(t[1]+t[4]     )/tot) << "%" << std::endl;
+        std::cout << "---------------------------------------------" << std::endl;
+        std::cout << std::endl;
+    }
+
+    // ========================================================================
+    // Back substitution: recover M(n) from partial values
+    //
+    // partialValues[i] holds S(x/k, u) at this point. Sweep j from nu
+    // down to 1, subtracting resolved M(x/j) from all its multiples.
+    // When we hit j=1, partialValues[1] = M(x).
+    // ========================================================================
+
+    if (cnt128 > 0) {
+        partialValues128.resize(partialValues.size());
+        for (UInt32 i = cnt128+1; i <= (UInt32)mx; ++i)
+            partialValues128[i] = (Int128)partialValues[i];
+
+        for (UInt32 jj = 1; jj <= (UInt32)nu; ++jj) {
+            const UInt32 i = nu - jj + 1;
+            const UInt32 hi = hash[i];
+            if (hi == 0) continue;
+
+            Int128 acc = partialValues128[hi];
+            for (UInt32 k = 2*i; k <= (UInt32)nu; k += i) {
+                const UInt32 hk = hash[k];
+                if (hk) acc -= partialValues128[hk];
+            }
+            partialValues128[hi] = acc;
+        }
+
+        return (Int64)partialValues128[1];
+    }
+
+    for (UInt32 jj = 1; jj <= (UInt32)nu; ++jj) {
+        const UInt32 i = nu - jj + 1;
+        const UInt32 hi = hash[i];
+        if (hi == 0) continue;
+
+        Int64 acc = partialValues[hi];
+        for (UInt32 k = 2*i; k <= (UInt32)nu; k += i) {
+            const UInt32 hk = hash[k];
+            if (hk) acc -= partialValues[hk];
+        }
+        partialValues[hi] = acc;
+    }
+
+    return partialValues[1];
+}
+
+} // anonymous namespace
+
+Int64 MertensHurst(UInt128 n, bool profile, UInt64 segmentCap,
+                   UInt64 uOverride, double uFactor, double nuRatio) {
+    MertensComputer computer;
+    return computer.compute(n, profile, segmentCap, uOverride, uFactor, nuRatio);
+}
+
+#undef START_PROFILE
+#undef END_PROFILE
